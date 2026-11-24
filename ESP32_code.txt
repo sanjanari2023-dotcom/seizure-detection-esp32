@@ -1,0 +1,688 @@
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+
+#include "MAX30105.h"
+#include "heartRate.h"
+#include "spo2_algorithm.h"
+
+// =====================================================
+// I2C ADDRESSES
+// =====================================================
+
+#define MPU6050_ADDR 0x68
+#define ADS1115_ADDR 0x48
+
+MAX30105 particleSensor;
+Adafruit_ADS1115 ads;
+
+// =====================================================
+// MPU6050 VARIABLES
+// =====================================================
+
+int16_t AccX, AccY, AccZ;
+int16_t GyroX, GyroY, GyroZ;
+
+float ax = 0;
+float ay = 0;
+float az = 0;
+
+float gx = 0;
+float gy = 0;
+float gz = 0;
+
+unsigned long lastMPURead = 0;
+
+// 20 ms = 50 Hz
+const unsigned long MPU_INTERVAL = 20;
+
+// =====================================================
+// BIOAMP / ADS1115
+// =====================================================
+
+int16_t bioRaw = 0;
+float bioVoltage = 0;
+
+unsigned long lastBioRead = 0;
+
+// 4 ms ≈ 250 Hz
+const unsigned long BIO_INTERVAL = 4;
+
+// =====================================================
+// HEART RATE SETTINGS
+// =====================================================
+
+const byte HR_AVG_SIZE = 6;
+
+float hrValues[HR_AVG_SIZE];
+
+byte hrIndex = 0;
+byte hrCount = 0;
+
+unsigned long lastBeatTime = 0;
+
+float currentBPM = 0;
+float previousBPM = 0;
+float averageBPM = 0;
+
+float lastValidHR = 0;
+
+bool haveValidHR = false;
+
+// =====================================================
+// SpO2 SETTINGS
+// =====================================================
+
+#define SPO2_BUFFER_SIZE 100
+
+uint32_t irBuffer[SPO2_BUFFER_SIZE];
+uint32_t redBuffer[SPO2_BUFFER_SIZE];
+
+int spo2Index = 0;
+
+byte downsampleCounter = 0;
+
+int32_t currentSpO2 = -999;
+int8_t currentSpO2Valid = 0;
+
+int32_t algorithmHR = -999;
+int8_t algorithmHRValid = 0;
+
+int32_t lastValidSpO2 = 0;
+
+bool haveValidSpO2 = false;
+
+// =====================================================
+// SERIAL OUTPUT
+// =====================================================
+
+unsigned long lastDisplayTime = 0;
+
+// 100 ms = 10 output packets per second
+const unsigned long DISPLAY_INTERVAL = 100;
+
+// Latest MAX30102 raw values
+uint32_t latestIR = 0;
+uint32_t latestRED = 0;
+
+bool fingerPresent = false;
+
+// =====================================================
+// MPU6050 INITIALIZATION
+// =====================================================
+
+void initMPU6050()
+{
+  Wire.beginTransmission(MPU6050_ADDR);
+
+  Wire.write(0x6B);   // PWR_MGMT_1
+  Wire.write(0x00);   // Wake up
+
+  byte error = Wire.endTransmission();
+
+  if (error == 0)
+  {
+    Serial.println("# MPU6050 detected");
+  }
+  else
+  {
+    Serial.println("# MPU6050 NOT FOUND");
+  }
+
+  delay(100);
+}
+
+// =====================================================
+// MPU6050 READ
+// =====================================================
+
+void readMPU6050()
+{
+  if (millis() - lastMPURead < MPU_INTERVAL)
+  {
+    return;
+  }
+
+  lastMPURead = millis();
+
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x3B);
+
+  if (Wire.endTransmission(false) != 0)
+  {
+    return;
+  }
+
+  Wire.requestFrom(
+      MPU6050_ADDR,
+      14,
+      true);
+
+  if (Wire.available() < 14)
+  {
+    return;
+  }
+
+  // Accelerometer
+  AccX =
+      (Wire.read() << 8) |
+      Wire.read();
+
+  AccY =
+      (Wire.read() << 8) |
+      Wire.read();
+
+  AccZ =
+      (Wire.read() << 8) |
+      Wire.read();
+
+  // Skip temperature
+  Wire.read();
+  Wire.read();
+
+  // Gyroscope
+  GyroX =
+      (Wire.read() << 8) |
+      Wire.read();
+
+  GyroY =
+      (Wire.read() << 8) |
+      Wire.read();
+
+  GyroZ =
+      (Wire.read() << 8) |
+      Wire.read();
+
+  // Convert raw values
+  ax = AccX / 16384.0;
+  ay = AccY / 16384.0;
+  az = AccZ / 16384.0;
+
+  gx = GyroX / 131.0;
+  gy = GyroY / 131.0;
+  gz = GyroZ / 131.0;
+}
+
+// =====================================================
+// BIOAMP READ
+// =====================================================
+
+void readBioAmp()
+{
+  if (millis() - lastBioRead < BIO_INTERVAL)
+  {
+    return;
+  }
+
+  lastBioRead = millis();
+
+  // BioAmp connected to ADS1115 A0
+  bioRaw = ads.readADC_SingleEnded(0);
+
+  // GAIN_ONE:
+  // ±4.096 V
+  // 0.125 mV per bit
+  bioVoltage =
+      bioRaw * 0.125 / 1000.0;
+}
+
+// =====================================================
+// RESET MAX30102
+// =====================================================
+
+void resetCurrentMeasurement()
+{
+  hrIndex = 0;
+  hrCount = 0;
+
+  lastBeatTime = 0;
+
+  currentBPM = 0;
+  previousBPM = 0;
+  averageBPM = 0;
+
+  spo2Index = 0;
+  downsampleCounter = 0;
+
+  currentSpO2 = -999;
+  currentSpO2Valid = 0;
+
+  haveValidHR = false;
+  haveValidSpO2 = false;
+
+  lastValidHR = 0;
+  lastValidSpO2 = 0;
+}
+
+// =====================================================
+// HEART RATE PROCESSING
+// =====================================================
+
+void processHeartRate(uint32_t irValue)
+{
+  if (!checkForBeat(irValue))
+  {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (lastBeatTime == 0)
+  {
+    lastBeatTime = now;
+    return;
+  }
+
+  unsigned long delta =
+      now - lastBeatTime;
+
+  lastBeatTime = now;
+
+  if (delta == 0)
+  {
+    return;
+  }
+
+  currentBPM =
+      60.0 /
+      ((float)delta / 1000.0);
+
+  // Valid BPM range
+  if (currentBPM < 45 ||
+      currentBPM > 160)
+  {
+    return;
+  }
+
+  // Reject sudden jumps
+  if (previousBPM > 0)
+  {
+    float difference =
+        fabs(currentBPM - previousBPM);
+
+    if (difference > 15)
+    {
+      return;
+    }
+  }
+
+  previousBPM = currentBPM;
+
+  // Store
+  hrValues[hrIndex] =
+      currentBPM;
+
+  hrIndex++;
+
+  if (hrIndex >= HR_AVG_SIZE)
+  {
+    hrIndex = 0;
+  }
+
+  if (hrCount < HR_AVG_SIZE)
+  {
+    hrCount++;
+  }
+
+  if (hrCount < HR_AVG_SIZE)
+  {
+    return;
+  }
+
+  float total = 0;
+
+  float minBPM = hrValues[0];
+  float maxBPM = hrValues[0];
+
+  for (byte i = 0;
+       i < HR_AVG_SIZE;
+       i++)
+  {
+    total += hrValues[i];
+
+    if (hrValues[i] < minBPM)
+    {
+      minBPM = hrValues[i];
+    }
+
+    if (hrValues[i] > maxBPM)
+    {
+      maxBPM = hrValues[i];
+    }
+  }
+
+  averageBPM =
+      total / HR_AVG_SIZE;
+
+  float spread =
+      maxBPM - minBPM;
+
+  if (spread <= 15)
+  {
+    lastValidHR =
+        averageBPM;
+
+    haveValidHR = true;
+  }
+}
+
+// =====================================================
+// SpO2 PROCESSING
+// =====================================================
+
+void processSpO2(
+    uint32_t redValue,
+    uint32_t irValue)
+{
+  downsampleCounter++;
+
+  // ~100 Hz -> ~25 Hz
+  if (downsampleCounter < 4)
+  {
+    return;
+  }
+
+  downsampleCounter = 0;
+
+  if (spo2Index < SPO2_BUFFER_SIZE)
+  {
+    irBuffer[spo2Index] =
+        irValue;
+
+    redBuffer[spo2Index] =
+        redValue;
+
+    spo2Index++;
+  }
+
+  if (spo2Index >= SPO2_BUFFER_SIZE)
+  {
+    maxim_heart_rate_and_oxygen_saturation(
+        irBuffer,
+        SPO2_BUFFER_SIZE,
+        redBuffer,
+        &currentSpO2,
+        &currentSpO2Valid,
+        &algorithmHR,
+        &algorithmHRValid);
+
+    if (currentSpO2Valid &&
+        currentSpO2 >= 85 &&
+        currentSpO2 <= 100)
+    {
+      lastValidSpO2 =
+          currentSpO2;
+
+      haveValidSpO2 = true;
+    }
+
+    // Keep last 75 samples
+    for (int i = 25;
+         i < SPO2_BUFFER_SIZE;
+         i++)
+    {
+      irBuffer[i - 25] =
+          irBuffer[i];
+
+      redBuffer[i - 25] =
+          redBuffer[i];
+    }
+
+    spo2Index = 75;
+  }
+}
+
+// =====================================================
+// SERIAL DATA OUTPUT
+// =====================================================
+
+void sendSerialData()
+{
+  if (millis() - lastDisplayTime <
+      DISPLAY_INTERVAL)
+  {
+    return;
+  }
+
+  lastDisplayTime = millis();
+
+  /*
+     CSV FORMAT:
+
+     millis,
+     HR,
+     SpO2,
+     IR,
+     RED,
+     AX,
+     AY,
+     AZ,
+     GX,
+     GY,
+     GZ,
+     BIO_RAW,
+     BIO_VOLTAGE
+  */
+
+  Serial.print(millis());
+  Serial.print(",");
+
+  // Heart Rate
+  if (fingerPresent && haveValidHR)
+  {
+    Serial.print(lastValidHR, 1);
+  }
+  else
+  {
+    Serial.print(-1);
+  }
+
+  Serial.print(",");
+
+  // SpO2
+  if (fingerPresent && haveValidSpO2)
+  {
+    Serial.print(lastValidSpO2);
+  }
+  else
+  {
+    Serial.print(-1);
+  }
+
+  Serial.print(",");
+
+  // MAX30102 raw
+  Serial.print(latestIR);
+  Serial.print(",");
+
+  Serial.print(latestRED);
+  Serial.print(",");
+
+  // MPU6050 accelerometer
+  Serial.print(ax, 3);
+  Serial.print(",");
+
+  Serial.print(ay, 3);
+  Serial.print(",");
+
+  Serial.print(az, 3);
+  Serial.print(",");
+
+  // MPU6050 gyroscope
+  Serial.print(gx, 2);
+  Serial.print(",");
+
+  Serial.print(gy, 2);
+  Serial.print(",");
+
+  Serial.print(gz, 2);
+  Serial.print(",");
+
+  // BioAmp
+  Serial.print(bioRaw);
+  Serial.print(",");
+
+  Serial.println(bioVoltage, 6);
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+  Serial.begin(115200);
+
+  delay(1000);
+
+  // ESP32 I2C
+  Wire.begin(21, 22);
+
+  Wire.setClock(400000);
+
+  Serial.println();
+  Serial.println("# Multimodal Sensor System");
+  Serial.println("# MPU6050 + MAX30102 + BioAmp");
+  Serial.println();
+
+  // ===================================================
+  // MPU6050
+  // ===================================================
+
+  initMPU6050();
+
+  // ===================================================
+  // ADS1115
+  // ===================================================
+
+  if (!ads.begin(ADS1115_ADDR))
+  {
+    Serial.println("# ADS1115 NOT FOUND");
+
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+
+  Serial.println("# ADS1115 detected");
+
+  // ±4.096 V
+  // 0.125 mV / bit
+  ads.setGain(GAIN_ONE);
+
+  // Fast ADC conversion
+  ads.setDataRate(RATE_ADS1115_860SPS);
+
+  // ===================================================
+  // MAX30102
+  // ===================================================
+
+  if (!particleSensor.begin(
+          Wire,
+          I2C_SPEED_FAST))
+  {
+    Serial.println(
+        "# MAX30102 NOT FOUND");
+
+    while (1)
+    {
+      delay(1000);
+    }
+  }
+
+  Serial.println(
+      "# MAX30102 detected");
+
+  // MAX30102 configuration
+  byte ledBrightness = 0x1F;
+  byte sampleAverage = 4;
+  byte ledMode = 2;
+
+  int sampleRate = 400;
+  int pulseWidth = 411;
+  int adcRange = 4096;
+
+  particleSensor.setup(
+      ledBrightness,
+      sampleAverage,
+      ledMode,
+      sampleRate,
+      pulseWidth,
+      adcRange);
+
+  particleSensor
+      .setPulseAmplitudeRed(0x1F);
+
+  particleSensor
+      .setPulseAmplitudeIR(0x1F);
+
+  particleSensor
+      .setPulseAmplitudeGreen(0);
+
+  Serial.println();
+  Serial.println("# System ready");
+
+  Serial.println(
+      "# millis,HR,SpO2,IR,RED,AX,AY,AZ,GX,GY,GZ,BIO_RAW,BIO_V");
+
+  Serial.println();
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+  // ---------------------------------------------------
+  // MPU6050
+  // ---------------------------------------------------
+
+  readMPU6050();
+
+  // ---------------------------------------------------
+  // BioAmp
+  // ---------------------------------------------------
+
+  readBioAmp();
+
+  // ---------------------------------------------------
+  // MAX30102
+  // ---------------------------------------------------
+
+  particleSensor.check();
+
+  while (particleSensor.available())
+  {
+    latestRED =
+        particleSensor.getFIFORed();
+
+    latestIR =
+        particleSensor.getFIFOIR();
+
+    particleSensor.nextSample();
+
+    fingerPresent =
+        (latestIR >= 10000);
+
+    if (!fingerPresent)
+    {
+      resetCurrentMeasurement();
+    }
+    else
+    {
+      processHeartRate(
+          latestIR);
+
+      processSpO2(
+          latestRED,
+          latestIR);
+    }
+  }
+
+  // ---------------------------------------------------
+  // Send everything to PC
+  // ---------------------------------------------------
+
+  sendSerialData();
+}
